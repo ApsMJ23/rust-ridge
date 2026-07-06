@@ -1,0 +1,19 @@
+Third-party assets
+==================
+
+public/dusty.glb    — "truck" model             } all from the Kenney Car Kit
+public/jackal.glb   — "sedan-sports" model      } https://kenney.nl/assets/car-kit
+public/vesper.glb   — "race" model              } License: CC0 1.0 (public domain,
+public/npc.glb      — "van" model               } no attribution required)
+public/boxer.glb    — "delivery" model          }
+public/sprinter.glb — "hatchback-sports" model  }
+public/nova.glb     — "race-future" model       }
+public/interceptor.glb — "police" model           }
+public/goliath.glb  — "firetruck" model           }
+
+public/formula.glb — "raceCarRed" model from the Kenney Racing Kit
+                     https://kenney.nl/assets/racing-kit — CC0 1.0
+public/Textures/colormap.png — Car Kit shared texture, CC0 1.0
+
+Everything else (code, audio, world) is original; all audio is synthesized
+at runtime via WebAudio — there are no audio assets.
