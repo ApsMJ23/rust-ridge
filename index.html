@@ -3,16 +3,14 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <meta name="description" content="Pizza Ridge - a city driving game. Race rivals, outrun chasers, and settle turf wars for Mabel's Pizza in an elite garage of cars." />
+  <meta name="description" content="Redline Run - thread a Ferrari through endless highway traffic. Don't crash." />
   <meta name="theme-color" content="#63bfd1" />
-  <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🍕</text></svg>" />
-  <title>Pizza Ridge - city driving</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🏎️</text></svg>" />
+  <title>Redline Run - highway dodge</title>
   <style>
     html, body { margin: 0; height: 100%; overflow: hidden; background: #ffd9ab; }
     canvas { display: block; }
 
-    /* film-style corner falloff over the render — zero GPU cost, big mood */
-    /* fixed + no z-index: above the (static) canvas, below the later HUD divs */
     #vignette {
       position: fixed; inset: 0; pointer-events: none;
       background: radial-gradient(ellipse at 50% 42%, transparent 52%, rgba(46, 22, 48, 0.34) 100%);
@@ -24,15 +22,34 @@
       100% { box-shadow: inset 0 0 18vmax rgba(255, 40, 30, 0); }
     }
 
-    #hud, #timer, #objective, #banner, #msg {
+    #hud, #dist, #banner, #msg {
       position: fixed; color: #fff; user-select: none; pointer-events: none;
       text-shadow: 0 1px 3px rgba(40, 20, 10, 0.45);
       font-family: system-ui, sans-serif;
     }
     #hud { left: 12px; bottom: 10px; font-size: 14px; line-height: 1.5; }
     #speed { font-size: 22px; font-weight: 700; }
-    #timer { top: 14px; left: 50%; transform: translateX(-50%); font-size: 30px; font-weight: 700; }
-    #objective { top: 54px; left: 50%; transform: translateX(-50%); font-size: 15px; font-weight: 600; white-space: nowrap; }
+    #dist { top: 14px; left: 50%; transform: translateX(-50%); text-align: center; }
+    #dist .m { font-size: 30px; font-weight: 800; }
+    #dist .best { font-size: 13px; font-weight: 600; opacity: 0.85; }
+
+    /* damage bar */
+    #health {
+      position: fixed; top: 14px; right: 16px; width: clamp(140px, 22vw, 240px); height: 14px;
+      border-radius: 999px; background: rgba(20, 12, 8, 0.55);
+      box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.25);
+      pointer-events: none; user-select: none; overflow: hidden;
+    }
+    #health-fill {
+      height: 100%; width: 100%;
+      background: linear-gradient(90deg, #ff5a3c, #ffd24a);
+      transition: width 0.18s ease, background 0.18s ease;
+    }
+    #health-label {
+      position: fixed; top: 32px; right: 16px; font: 700 11px system-ui, sans-serif;
+      letter-spacing: 0.14em; color: #ffe9cf; opacity: 0.8; pointer-events: none; user-select: none;
+    }
+
     #toast {
       position: fixed; bottom: 16vh; left: 50%; transform: translateX(-50%);
       padding: 9px 18px; border-radius: 999px; text-align: center;
@@ -47,39 +64,13 @@
       12%, 78% { opacity: 1; transform: translate(-50%, 0); }
       100% { opacity: 0; transform: translate(-50%, -6px); }
     }
-    #banner { top: 32vh; left: 0; right: 0; text-align: center; font-size: 42px; font-weight: 800; }
-    #msg { top: calc(32vh + 56px); left: 0; right: 0; text-align: center; font-size: 17px; font-weight: 500; }
-
-    #minimap {
-      position: fixed; top: 14px; right: 14px; z-index: 2;
-      width: clamp(138px, 19vw, 190px); height: clamp(138px, 19vw, 190px);
-      border-radius: 8px;
-      box-shadow: 0 6px 18px rgba(30, 20, 10, 0.28);
-      pointer-events: none; user-select: none;
-    }
-
+    #banner { top: 30vh; left: 0; right: 0; text-align: center; font-size: 46px; font-weight: 800; }
+    #msg { top: calc(30vh + 60px); left: 0; right: 0; text-align: center; font-size: 17px; font-weight: 500; }
     #banner.pop { animation: pop 0.45s cubic-bezier(0.2, 1.6, 0.4, 1); }
     @keyframes pop {
       from { transform: scale(1.7); opacity: 0; }
       to { transform: scale(1); opacity: 1; }
     }
-
-    /* dispatcher's speech bubble */
-    #bubble {
-      position: fixed; transform: translate(-50%, -100%);
-      max-width: 250px; padding: 10px 14px; border-radius: 14px;
-      background: #fffdf6; color: #4a3527;
-      font: 14px/1.45 system-ui, sans-serif;
-      box-shadow: 0 3px 14px rgba(60, 30, 10, 0.25);
-      pointer-events: none; user-select: none;
-      transition: opacity 0.15s;
-    }
-    #bubble::after {
-      content: ''; position: absolute; left: 50%; bottom: -9px; margin-left: -9px;
-      border-left: 9px solid transparent; border-right: 9px solid transparent;
-      border-top: 10px solid #fffdf6;
-    }
-    #bubble b { display: block; color: #c96f4a; letter-spacing: 0.08em; font-size: 12px; margin-bottom: 2px; }
 
     /* title screen */
     #title {
@@ -107,48 +98,33 @@
     }
     #title .toggles button:hover { background: rgba(255, 255, 255, 0.25); }
     #title .credits { margin-top: 26px; }
-
-    @media (max-width: 700px) {
-      #objective {
-        top: 50px; max-width: calc(100vw - 172px); overflow: hidden;
-        text-overflow: ellipsis;
-      }
-      #minimap {
-        top: 72px; right: 10px;
-        width: 130px; height: 130px;
-      }
-      #msg {
-        left: 16px; right: 16px;
-      }
-    }
   </style>
 </head>
 <body>
   <div id="vignette"></div>
   <div id="hud">
     <div id="speed">0 km/h</div>
-    WASD / arrows or gamepad &middot; Space drifts &middot; G swaps cars &middot; H honks &middot; R restarts
+    WASD / arrows or gamepad &middot; Space drifts &middot; G swaps cars &middot; R restarts
   </div>
-  <div id="timer"></div>
-  <div id="objective"></div>
+  <div id="dist"><span class="m">0 m</span><br /><span class="best"></span></div>
+  <div id="health"><div id="health-fill"></div></div>
+  <div id="health-label">CONDITION</div>
   <div id="banner"></div>
   <div id="msg"></div>
   <div id="toast"></div>
-  <div id="bubble" hidden><b>MABEL'S PIZZA</b>Crusty's crew is making moves across town. Pick a glowing job and go handle it.</div>
-  <canvas id="minimap" width="220" height="220" aria-label="Delivery route map"></canvas>
 
   <div id="title">
     <div>
-      <h1>PIZZA RIDGE</h1>
-      <p class="tag">A whole city. A hot stack of pizzas. Zero speed limits.</p>
+      <h1>REDLINE RUN</h1>
+      <p class="tag">One Ferrari. Endless traffic. Don't crash.</p>
       <p class="press">Click or press any key to drive</p>
       <p id="best-line" class="small"></p>
       <div class="toggles">
         <button id="btn-sound">sound: on</button>
-        <button id="btn-motion">camera motion: full</button>
+        <button id="btn-quality">quality: high</button>
       </div>
       <p id="touch-note" class="small" hidden>best played with a keyboard or gamepad</p>
-      <p class="small credits">CC0 models by Kenney &middot; built with three.js &middot; original characters, all audio synthesized</p>
+      <p class="small credits">Ferrari &amp; Lamborghini models (various authors) &middot; engine loops (CC0) via OpenGameArt &middot; built with three.js</p>
     </div>
   </div>
 

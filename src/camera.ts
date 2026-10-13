@@ -1,46 +1,34 @@
 import * as THREE from 'three'
 import { TUNING as T } from './tuning.ts'
 
-const BASE_FOV = 62
+const BASE_FOV = 58
 
-// Chase camera: sits behind the car along its heading, follows with
-// frame-rate-independent damping, and widens FOV with speed for the rush.
-// During a slide the anchor blends toward the velocity direction — the camera
-// hangs behind where the car is GOING, so a drift shows the car at an angle.
+// Mounted chase rig: sits at a fixed offset behind the car in world space and
+// eases to track its lateral position. Deliberately NO bank / shake / FOV kick /
+// velocity sway — the view should feel bolted to a boom, not handheld. Forward
+// is world -z, so the rig never yaws with the car; the road stays level.
 export class ChaseCamera {
   readonly camera: THREE.PerspectiveCamera
-  private readonly desired = new THREE.Vector3()
+  private followX = 0
   private readonly look = new THREE.Vector3()
-  private fovRatio = 0
 
   constructor(aspect: number) {
-    this.camera = new THREE.PerspectiveCamera(BASE_FOV, aspect, 0.1, 1200)
+    this.camera = new THREE.PerspectiveCamera(BASE_FOV, aspect, 0.15, 1400)
     this.camera.position.set(0, T.camHeight, T.camDist)
   }
 
-  update(
-    dt: number,
-    target: THREE.Vector3,
-    heading: number,
-    speedRatio: number,
-    velHeading = heading,
-    driftBlend = 0,
-  ) {
-    let dh = velHeading - heading
-    dh = ((dh + Math.PI) % (Math.PI * 2)) - Math.PI
-    if (dh < -Math.PI) dh += Math.PI * 2
-    const h = heading + dh * driftBlend
-    this.desired.set(
-      target.x + Math.sin(h) * T.camDist,
-      T.camHeight,
-      target.z + Math.cos(h) * T.camDist,
-    )
-    this.camera.position.lerp(this.desired, 1 - Math.exp(-T.camLag * dt))
-    this.look.set(target.x, 1.2, target.z)
-    this.camera.lookAt(this.look)
+  // snap straight behind the car — spawn and restart, so it doesn't glide in
+  reset(x: number, z: number) {
+    this.followX = x
+    this.camera.position.set(x, T.camHeight, z + T.camDist)
+  }
 
-    this.fovRatio += (speedRatio - this.fovRatio) * (1 - Math.exp(-3 * dt))
-    this.camera.fov = BASE_FOV + T.fovKick * this.fovRatio
-    this.camera.updateProjectionMatrix()
+  update(dt: number, target: THREE.Vector3) {
+    // ease laterally so lane changes settle smoothly instead of the car sliding
+    this.followX += (target.x - this.followX) * (1 - Math.exp(-7 * dt))
+    this.camera.position.set(this.followX, T.camHeight, target.z + T.camDist)
+    this.camera.up.set(0, 1, 0)
+    this.look.set(this.followX, 1.2, target.z - T.camLookAhead)
+    this.camera.lookAt(this.look)
   }
 }

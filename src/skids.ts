@@ -4,8 +4,8 @@ import * as THREE from 'three'
 // fading out by vertex alpha. Fixed buffers, zero per-frame allocation.
 const MAX = 512
 const LIFE = 7 // s
-const HALF_W = 0.15
-const ALPHA = 0.32
+const HALF_W = 0.18
+const ALPHA = 0.42
 
 export class Skids {
   readonly mesh: THREE.Mesh
@@ -35,7 +35,12 @@ export class Skids {
 
     this.mesh = new THREE.Mesh(
       geo,
-      new THREE.MeshBasicMaterial({ vertexColors: true, transparent: true, depthWrite: false }),
+      new THREE.MeshBasicMaterial({
+        vertexColors: true,
+        transparent: true,
+        depthWrite: false,
+        opacity: 0.95,
+      }),
     )
     this.mesh.frustumCulled = false
   }

@@ -1,19 +1,37 @@
 Third-party assets
 ==================
 
-public/dusty.glb    — "truck" model             } all from the Kenney Car Kit
-public/jackal.glb   — "sedan-sports" model      } https://kenney.nl/assets/car-kit
-public/vesper.glb   — "race" model              } License: CC0 1.0 (public domain,
-public/npc.glb      — "van" model               } no attribution required)
-public/boxer.glb    — "delivery" model          }
-public/sprinter.glb — "hatchback-sports" model  }
-public/nova.glb     — "race-future" model       }
-public/interceptor.glb — "police" model           }
-public/goliath.glb  — "firetruck" model           }
+Textures & HDRI (Poly Haven — CC0 1.0, public domain)
+----------------------------------------------------
+public/textures/hdri/kloppenheim_06_puresky_1k.hdr
+  — https://polyhaven.com/a/kloppenheim_06_puresky
 
-public/formula.glb — "raceCarRed" model from the Kenney Racing Kit
-                     https://kenney.nl/assets/racing-kit — CC0 1.0
-public/Textures/colormap.png — Car Kit shared texture, CC0 1.0
+public/textures/asphalt/asphalt_02_*_1k.jpg
+  — https://polyhaven.com/a/asphalt_02
 
-Everything else (code, audio, world) is original; all audio is synthesized
-at runtime via WebAudio — there are no audio assets.
+public/textures/concrete/concrete_floor_*_1k.jpg
+  — https://polyhaven.com/a/concrete_floor_painted
+
+public/textures/brick/brick_wall_*_1k.jpg
+  — https://polyhaven.com/a/red_brick_03
+
+public/textures/plaster/plaster_wall_*_1k.jpg
+  — https://polyhaven.com/a/painted_plaster_wall
+
+public/textures/dirt/ground_dirt_*_1k.jpg
+  — https://polyhaven.com/a/brown_mud_leaves_01
+
+public/textures/dirt/grass_ground_*_1k.jpg
+  — https://polyhaven.com/a/aerial_grass_rock
+
+Legacy vehicle GLBs (optional / unused by procedural fleet)
+-----------------------------------------------------------
+public/dusty.glb … public/formula.glb — Kenney Car Kit / Racing Kit
+  https://kenney.nl/assets/car-kit
+  https://kenney.nl/assets/racing-kit
+  License: CC0 1.0
+
+public/Textures/colormap.png — Kenney Car Kit shared texture, CC0 1.0
+
+Everything else (code, procedural vehicles, world, audio) is original.
+All audio is synthesized at runtime via WebAudio — there are no audio assets.

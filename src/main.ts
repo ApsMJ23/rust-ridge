@@ -1,23 +1,17 @@
 import * as THREE from 'three'
-import { honk, initAudio, playImpact, playShift, setMuted, updateEngine } from './audio.ts'
+import { initAudio, playImpact, playShift, setEngineLoop, setMuted, updateEngine } from './audio.ts'
 import { Car } from './car.ts'
-import { applyCarPreset, CARS, unlockedCars, type CarDef } from './cars.ts'
+import { applyCarPreset, CARS, type CarDef } from './cars.ts'
 import { ChaseCamera } from './camera.ts'
 import { Dust } from './dust.ts'
 import { readControls, type Controls } from './input.ts'
-import { buildSky, HORIZON, noiseTexture, toonMat } from './look.ts'
-import { MissionManager, type GameState } from './mission.ts'
-import { MISSIONS } from './missions.ts'
-import { Minimap } from './minimap.ts'
-import { Npc } from './npc.ts'
-import { Peds } from './peds.ts'
-import { Props } from './props.ts'
+import { buildSky, HORIZON, loadOutdoorEnv } from './look.ts'
+import { loadWorldMaterials, qualityFromPref, qualitySettings, type QualityLevel } from './materials.ts'
+import { PostFX } from './postfx.ts'
 import { Skids } from './skids.ts'
-import { buildTown } from './town.ts'
-import { Traffic } from './traffic.ts'
-import { initTuningPanel, TUNING as T } from './tuning.ts'
+import { buildRoad, HighwayTraffic, ROAD_HALF } from './highway.ts'
+import { TUNING as T } from './tuning.ts'
 
-const SPAWN = { x: 0, z: 205, heading: 0 } // outside Pizza HQ, facing into the city
 const IDLE: Controls = {
   throttle: 0,
   brake: 0,
@@ -27,6 +21,12 @@ const IDLE: Controls = {
   shiftDown: false,
   toggleGearbox: false,
 }
+
+// crash model: three good hits and you're wrecked; a brief i-frame window so one
+// scrape doesn't chew the whole bar in a handful of contact frames.
+const MAX_HP = 100
+const HIT_DMG = 40
+const INVULN = 1.0
 
 // ---------- persistence (storage can be blocked — play without it) ----------
 function loadPref(key: string): string | null {
@@ -44,203 +44,169 @@ function savePref(key: string, value: string) {
   }
 }
 
-function loadSave(): { completed: Record<string, number>; car: string } {
-  try {
-    const raw = loadPref('rr1.save')
-    if (raw) {
-      const s = JSON.parse(raw)
-      if (s && typeof s.completed === 'object' && s.completed !== null) {
-        // keep only sane best times — corrupt values would poison record
-        // tracking and unlock gating forever, since they round-trip each save
-        const completed: Record<string, number> = {}
-        for (const [k, v] of Object.entries(s.completed)) {
-          if (typeof v === 'number' && Number.isFinite(v) && v > 0) completed[k] = v
-        }
-        return { completed, car: String(s.car ?? 'dusty') }
-      }
-    }
-  } catch {
-    /* corrupt save — start fresh */
-  }
-  return { completed: {}, car: 'dusty' }
-}
-const save = loadSave()
+let best = Math.max(0, Math.floor(Number(loadPref('rr2.best')) || 0))
+
+// ---------- quality ----------
+let qualityLevel: QualityLevel = qualityFromPref(loadPref('rr1.quality'))
+let quality = qualitySettings(qualityLevel)
 
 // ---------- scene ----------
-const renderer = new THREE.WebGLRenderer({ antialias: true })
-renderer.setPixelRatio(Math.min(devicePixelRatio, 2))
+const renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance' })
+renderer.setPixelRatio(quality.pixelRatio)
 renderer.setSize(innerWidth, innerHeight)
-// realistic pass: filmic tone mapping + real shadow maps
+renderer.outputColorSpace = THREE.SRGBColorSpace
 renderer.toneMapping = THREE.ACESFilmicToneMapping
-renderer.toneMappingExposure = 1.28
+renderer.toneMappingExposure = 0.98
 renderer.shadowMap.enabled = true
 renderer.shadowMap.type = THREE.PCFSoftShadowMap
 document.body.appendChild(renderer.domElement)
 
 const scene = new THREE.Scene()
-scene.fog = new THREE.Fog(HORIZON, 180, 850)
-scene.add(buildSky())
+scene.fog = new THREE.Fog(HORIZON, 220, 920)
 
-// neutral studio environment gives the PBR materials something to reflect
 {
-  const { RoomEnvironment } = await import('three/addons/environments/RoomEnvironment.js')
-  const pmrem = new THREE.PMREMGenerator(renderer)
-  scene.environment = pmrem.fromScene(new RoomEnvironment(), 0.04).texture
-  scene.environmentIntensity = 0.45
-  pmrem.dispose()
+  const outdoor = await loadOutdoorEnv(renderer, quality.envIntensity)
+  if (outdoor) {
+    scene.environment = outdoor.env
+    scene.environmentIntensity = (outdoor.env.userData.intensity as number) ?? quality.envIntensity
+  }
+  if (outdoor?.background) {
+    scene.background = outdoor.background // real photographed sky
+    scene.fog!.color.set('#bcc6cc') // blend distance into the sky's horizon, not tan
+  } else {
+    scene.add(buildSky()) // painted fallback dome
+  }
 }
 
-scene.add(new THREE.HemisphereLight('#ffe9cf', '#b08a5e', 0.75))
-const sun = new THREE.DirectionalLight('#ffd9a0', 3.6)
+scene.add(new THREE.HemisphereLight('#c8d8e8', '#6a5a48', 0.45))
+const sun = new THREE.DirectionalLight('#fff0d0', 2.7)
 sun.castShadow = true
-sun.shadow.mapSize.set(2048, 2048)
-sun.shadow.camera.left = -110
-sun.shadow.camera.right = 110
-sun.shadow.camera.top = 110
-sun.shadow.camera.bottom = -110
-sun.shadow.camera.near = 10
-sun.shadow.camera.far = 400
-sun.shadow.bias = -0.0004
-sun.shadow.normalBias = 0.6
+sun.shadow.mapSize.set(quality.shadowMapSize, quality.shadowMapSize)
+const SHADOW_EXT = 90
+sun.shadow.camera.left = -SHADOW_EXT
+sun.shadow.camera.right = SHADOW_EXT
+sun.shadow.camera.top = SHADOW_EXT
+sun.shadow.camera.bottom = -SHADOW_EXT
+sun.shadow.camera.near = 5
+sun.shadow.camera.far = 280
+sun.shadow.bias = -0.00025
+sun.shadow.normalBias = 0.35
 scene.add(sun, sun.target)
 
-const groundTex = noiseTexture(126, 12)
-groundTex.repeat.set(160, 160)
-const ground = new THREE.Mesh(new THREE.PlaneGeometry(2000, 2000), toonMat('#d6bf8b', groundTex, 0.95))
-ground.rotation.x = -Math.PI / 2
-ground.receiveShadow = true
-scene.add(ground)
-
-// scrub outside the city for motion cues - instanced, one draw call
-{
-  const rocks = new THREE.InstancedMesh(new THREE.BoxGeometry(1, 1, 1), toonMat('#c9a06b'), 150)
-  rocks.castShadow = true
-  rocks.receiveShadow = true
-  const m = new THREE.Object3D()
-  for (let i = 0; i < rocks.count; i++) {
-    do {
-      m.position.set((Math.random() - 0.5) * 800, 0, (Math.random() - 0.5) * 800)
-    } while (Math.abs(m.position.x) < 305 && m.position.z < 235 && m.position.z > -360)
-    const s = 0.5 + Math.random() * 1.5
-    m.scale.set(s, s * 0.6, s)
-    m.position.y = s * 0.3
-    m.rotation.y = Math.random() * Math.PI
-    m.updateMatrix()
-    rocks.setMatrixAt(i, m.matrix)
-  }
-  scene.add(rocks)
-
-  // a ring of cones beside the pickup bay
-  const cones = new THREE.InstancedMesh(new THREE.ConeGeometry(0.4, 1, 8), toonMat('#ff7f2a'), 8)
-  m.rotation.y = 0
-  m.scale.set(1, 1, 1)
-  for (let i = 0; i < cones.count; i++) {
-    const a = (i / cones.count) * Math.PI * 2
-    m.position.set(-36 + Math.sin(a) * 12, 0.5, 192 + Math.cos(a) * 12)
-    m.updateMatrix()
-    cones.setMatrixAt(i, m.matrix)
-  }
-  scene.add(cones)
-}
-
-const obstacles = buildTown(scene)
-const missions = new MissionManager(MISSIONS, save.completed)
-scene.add(missions.group)
-
-// the living city: traffic you can crash into, pedestrians who bail out of
-// the way, and street clutter that goes flying.
-// props first: it filters against building footprints, so the obstacles array
-// must not contain the (moving) traffic entries yet
-const props = new Props(obstacles)
-props.onImpact = (intensity) => playImpact(intensity)
-scene.add(props.group)
-const traffic = new Traffic()
-obstacles.push(...traffic.obstacles) // traffic mutates these in place each step
+// ---------- the highway ----------
+const worldMats = await loadWorldMaterials(quality.anisotropy)
+const road = buildRoad(worldMats)
+scene.add(road.group)
+const traffic = new HighwayTraffic()
 scene.add(traffic.group)
-const peds = new Peds()
-scene.add(peds.group)
+// solid guardrails: two long collision walls at the road edges that track the
+// player, so the car scrapes along the barrier instead of leaving the asphalt.
+// Same Obstacle type as traffic; appended past the traffic-owned indices.
+const RAIL_X = ROAD_HALF + 1
+const rails = [
+  { x: -RAIL_X, z: 0, hw: 0.3, hd: 400 },
+  { x: RAIL_X, z: 0, hw: 0.3, hd: 400 },
+]
+const obstacles = [...traffic.obstacles, ...rails]
 
-// Mabel, parked by Pizza HQ facing the road
-const npc = new Npc(11, 193, Math.PI / 2)
-npc.load('./npc.glb').catch((e) => console.warn('npc model failed to load', e))
-scene.add(npc.mesh)
-
-// ---------- the car + roster ----------
-let currentCar: CarDef =
-  unlockedCars(missions.completed).find((c) => c.id === save.car) ?? CARS[0]
+// ---------- the car ----------
+let carIndex = Math.max(0, CARS.findIndex((c) => c.id === loadPref('rr2.car')))
+let currentCar: CarDef = CARS[carIndex]
 applyCarPreset(currentCar)
-
-// headlamp dots + tail lights, on the group so it survives model swaps.
-// No beams and no ground pool: warm additive glow on daylit tarmac reads as
-// a brown stain from the chase camera, not as light. Streetlights keep their
-// pools because a glow under a lamp has context; one under a moving car doesn't.
-function buildCarLights(): THREE.Group {
-  const g = new THREE.Group()
-  const lampMat = new THREE.MeshBasicMaterial({ color: '#fff6d0' })
-  const tailMat = new THREE.MeshBasicMaterial({ color: '#ff3b2e' })
-  for (const sx of [-0.6, 0.6]) {
-    const lamp = new THREE.Mesh(new THREE.SphereGeometry(0.11, 8, 6), lampMat)
-    lamp.position.set(sx, 0.6, -2.02)
-    const tail = new THREE.Mesh(new THREE.BoxGeometry(0.3, 0.1, 0.06), tailMat)
-    tail.position.set(sx, 0.6, 2.02)
-    g.add(lamp, tail)
-  }
-  return g
-}
-
 const car = new Car()
-car.mesh.add(buildCarLights())
 car.setGears(currentCar.gears)
 const savedGearMode = loadPref('rr1.gearMode')
 if (savedGearMode === 'manual' || savedGearMode === 'auto') car.setGearMode(savedGearMode)
 scene.add(car.mesh)
-car.loadModel(currentCar.model, currentCar.recolor).catch((e) => console.warn('car model failed to load, keeping the box', e))
-car.resetTo(SPAWN.x, SPAWN.z, SPAWN.heading)
+function loadCar(def: CarDef) {
+  setEngineLoop(def.engine) // switch to this car's recorded engine loop
+  car.configureWheels(def.spinWheels !== false, def.wheelAxis ?? 'x', def.wheelNodes)
+  car.loadModel(def.model, def.recolor, def.id, def.glb, def.modelYaw).catch((e) =>
+    console.warn('car model failed to load', e),
+  )
+}
+loadCar(currentCar)
+car.resetTo(0, 0, 0)
 let heardShiftSerial = car.shiftSerial
-const chase = new ChaseCamera(innerWidth / innerHeight)
-chase.camera.position.set(SPAWN.x, T.camHeight, SPAWN.z + T.camDist)
 
+// G cycles the garage — swaps model + handling + engine voice mid-drive
+function selectCar(i: number) {
+  carIndex = (i + CARS.length) % CARS.length
+  currentCar = CARS[carIndex]
+  applyCarPreset(currentCar)
+  car.setGears(currentCar.gears)
+  loadCar(currentCar)
+  savePref('rr2.car', currentCar.id)
+  showToast(`${currentCar.name} — ${currentCar.blurb}`)
+}
+
+const chase = new ChaseCamera(innerWidth / innerHeight)
+chase.camera.position.set(0, T.camHeight, T.camDist)
+const postfx = new PostFX(renderer, scene, chase.camera, quality)
+postfx.setPixelRatio(quality.pixelRatio)
+
+const skids = new Skids()
+scene.add(skids.mesh)
 const dust = new Dust()
 scene.add(dust.points)
 const dustL = new THREE.Vector3()
 const dustR = new THREE.Vector3()
-const skids = new Skids()
-scene.add(skids.mesh)
 const prevL = new THREE.Vector3()
 const prevR = new THREE.Vector3()
 let skidActive = false
 
-function persistSave() {
-  savePref('rr1.save', JSON.stringify({ v: 1, completed: missions.completed, car: currentCar.id }))
+// ---------- run state ----------
+let health = MAX_HP
+let invuln = 0
+let dead = false
+
+function restart() {
+  health = MAX_HP
+  invuln = 0
+  dead = false
+  car.resetTo(0, 0, 0)
+  chase.reset(0, 0)
+  traffic.reset(0)
+  skidActive = false
+  bannerEl.textContent = ''
+  msgEl.textContent = ''
 }
 
-function selectCar(def: CarDef) {
-  currentCar = def
-  applyCarPreset(def)
-  car.setGears(def.gears)
-  car.loadModel(def.model, def.recolor).catch((e) => console.warn('car model failed to load', e))
-  persistSave()
-  showToast(`${def.name} — ${def.blurb}`)
+function die() {
+  dead = true
+  const dist = Math.max(0, Math.floor(-car.z))
+  if (dist > best) {
+    best = dist
+    savePref('rr2.best', String(best))
+  }
+  bannerEl.textContent = 'WRECKED'
+  bannerEl.classList.remove('pop')
+  void bannerEl.offsetWidth
+  bannerEl.classList.add('pop')
+  msgEl.textContent = `${dist} m · best ${best} m · R to run again`
+}
+
+function flashHit() {
+  vignetteEl.classList.remove('hit')
+  void vignetteEl.offsetWidth
+  vignetteEl.classList.add('hit')
 }
 
 // ---------- settings ----------
 let soundOn = loadPref('rr1.sound') !== 'off'
-let motionFull = loadPref('rr1.motion') !== 'reduced'
 setMuted(!soundOn)
-T.fovKick = motionFull ? 8 : 0
 
 // ---------- title screen ----------
 let titleOpen = true
 const titleEl = document.getElementById('title')!
 const btnSound = document.getElementById('btn-sound')!
-const btnMotion = document.getElementById('btn-motion')!
+const btnQuality = document.getElementById('btn-quality')!
 const bestLine = document.getElementById('best-line')!
 
 function syncSettingsUi() {
   btnSound.textContent = `sound: ${soundOn ? 'on' : 'off'}`
-  btnMotion.textContent = `camera motion: ${motionFull ? 'full' : 'reduced'}`
-  const done = Object.keys(missions.completed).length
-  bestLine.textContent = done > 0 ? `${done}/${MISSIONS.length} jobs done` : ''
+  btnQuality.textContent = `quality: ${qualityLevel}`
+  bestLine.textContent = best > 0 ? `best run · ${best} m` : ''
 }
 syncSettingsUi()
 if (matchMedia('(pointer: coarse)').matches) {
@@ -253,20 +219,32 @@ btnSound.addEventListener('click', (e) => {
   setMuted(!soundOn)
   syncSettingsUi()
 })
-btnMotion.addEventListener('click', (e) => {
+btnQuality.addEventListener('click', (e) => {
   e.stopPropagation()
-  motionFull = !motionFull
-  savePref('rr1.motion', motionFull ? 'full' : 'reduced')
-  T.fovKick = motionFull ? 8 : 0
+  qualityLevel = qualityLevel === 'high' ? 'medium' : qualityLevel === 'medium' ? 'low' : 'high'
+  quality = qualitySettings(qualityLevel)
+  savePref('rr1.quality', qualityLevel)
+  renderer.setPixelRatio(quality.pixelRatio)
+  sun.shadow.mapSize.set(quality.shadowMapSize, quality.shadowMapSize)
+  if (sun.shadow.map) {
+    sun.shadow.map.dispose()
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    ;(sun.shadow as any).map = null
+  }
+  postfx.applyQuality(quality)
+  postfx.setPixelRatio(quality.pixelRatio)
+  postfx.setSize(innerWidth, innerHeight)
+  scene.environmentIntensity = quality.envIntensity
   syncSettingsUi()
+  showToast(`graphics: ${qualityLevel}`)
 })
 
 function closeTitle() {
   if (!titleOpen) return
   titleOpen = false
-  titleEl.inert = true // blur + drop the settings buttons from focus/tab order
+  titleEl.inert = true
   titleEl.classList.add('hidden')
-  initAudio() // we are inside a user gesture here
+  initAudio()
 }
 titleEl.addEventListener('click', closeTitle)
 
@@ -277,191 +255,36 @@ addEventListener('keydown', (e) => {
     closeTitle()
     return
   }
-  if (e.code === 'KeyR') {
-    const pose = missions.retry() ?? SPAWN // retry the run, or just respawn in free roam
-    car.resetTo(pose.x, pose.z, pose.heading)
-    chase.camera.position.set(
-      pose.x + Math.sin(pose.heading) * T.camDist,
-      T.camHeight,
-      pose.z + Math.cos(pose.heading) * T.camDist,
-    )
-    skidActive = false // else stale prev points draw a skid streak across the map
-    lastState = missions.state
-    goTimer = missions.state === 'running' ? 1.0 : 0
-    briefTimer = missions.state === 'running' ? 5 : 0
-  } else if (e.code === 'KeyG') {
-    const list = unlockedCars(missions.completed)
-    if (list.length < 2) {
-      showToast(`${currentCar.name} is your only ride — win jobs to unlock more`)
-    } else {
-      selectCar(list[(list.findIndex((c) => c.id === currentCar.id) + 1) % list.length])
-    }
-  } else if (e.code === 'KeyH') {
-    honk()
-    peds.reactHonk(car.x, car.z)
-  }
+  if (e.code === 'KeyR') restart()
+  else if (e.code === 'KeyG') selectCar(carIndex + 1)
 })
-// AudioContext needs a real activation; keep retrying on gestures (Escape
-// as the very first key would otherwise latch it suspended)
 addEventListener('keydown', initAudio)
 addEventListener('pointerdown', initAudio)
 
-initTuningPanel().catch((e) => console.warn('tuning panel unavailable', e))
-
 // ---------- HUD ----------
 const speedEl = document.getElementById('speed')!
-const timerEl = document.getElementById('timer')!
+const distEl = document.querySelector('#dist .m')!
+const distBestEl = document.querySelector('#dist .best')!
+const healthFill = document.getElementById('health-fill') as HTMLElement
 const bannerEl = document.getElementById('banner')!
 const msgEl = document.getElementById('msg')!
-const objectiveEl = document.getElementById('objective')!
-const bubbleEl = document.getElementById('bubble')!
 const toastEl = document.getElementById('toast')!
-const minimap = new Minimap(document.getElementById('minimap') as HTMLCanvasElement, MISSIONS)
+const vignetteEl = document.getElementById('vignette')!
 
 let shownSpeed = -1
 let shownGear = ''
-let shownTimer = -2
-let hudTitle = !titleOpen // deliberately stale so the first syncHud paints
-let hudState: GameState = missions.state
-let hudMission = ''
-let hudGo = false
-let hudBrief = false
-let objKey = ' ' // stale so the first syncHud paints
-let shownStrikes = 0
-let shownSmashed = 0
-let lastState: GameState = missions.state
-let goTimer = 0
-let briefTimer = 0
+let shownDist = -1
+let shownHealth = -1
 let contextLost = false
-const vignetteEl = document.getElementById('vignette')!
 
 function showToast(text: string) {
   toastEl.textContent = text
   toastEl.classList.remove('show')
-  void toastEl.offsetWidth // restart the animation
+  void toastEl.offsetWidth
   toastEl.classList.add('show')
 }
 
-function syncHud() {
-  if (contextLost) return // don't clobber the context-lost message
-  const st = missions.state
-  const def = missions.active
-  const id = def ? def.id : ''
-  const go = goTimer > 0
-  const brief = briefTimer > 0
-
-  if (titleOpen !== hudTitle || st !== hudState || id !== hudMission || go !== hudGo || brief !== hudBrief) {
-    hudTitle = titleOpen
-    hudState = st
-    hudMission = id
-    hudGo = go
-    hudBrief = brief
-    let banner = ''
-    let msg = ''
-    if (!titleOpen) {
-      if (st === 'idle') {
-        msg = 'Drive into a glowing marker to start a job · G swaps cars'
-      } else if (st === 'running' && def) {
-        banner = go ? 'GO!' : ''
-        msg = brief ? `“${def.brief}”` : ''
-      } else if (st === 'won' && def) {
-        banner = 'Nailed it!'
-        msg = `“${def.winLine}” · ${missions.elapsed.toFixed(1)}s${
-          missions.lastWinWasRecord ? ' · NEW RECORD!' : ''
-        } · R reruns it`
-      } else if (st === 'lost' && def) {
-        banner = 'Out of time!'
-        msg = `“${def.loseLine}” · R retries`
-      }
-    }
-    bannerEl.textContent = banner
-    msgEl.textContent = msg
-    if (banner) {
-      bannerEl.classList.remove('pop')
-      void bannerEl.offsetWidth
-      bannerEl.classList.add('pop')
-    }
-  }
-
-  const t = st === 'running' ? Math.ceil(missions.timeLeft) : -1
-  if (t !== shownTimer) {
-    shownTimer = t
-    timerEl.textContent = t >= 0 ? String(t) : ''
-    timerEl.style.color = t >= 0 && t <= 10 ? '#ff6b57' : '#ffffff'
-  }
-
-  const key =
-    st === 'running' && def
-      ? `${id}:${missions.index}:${missions.collected}:${missions.rivalIndex}:${missions.strikes}:${missions.smashed}`
-      : ''
-  if (key !== objKey) {
-    objKey = key
-    if (!key || !def) {
-      objectiveEl.textContent = ''
-    } else {
-      const obj = def.objective
-      if (obj.type === 'checkpoints') {
-        objectiveEl.textContent = `${def.title} · ${missions.index}/${obj.route.length} deliveries`
-      } else if (obj.type === 'race') {
-        objectiveEl.textContent = `${def.title} · you ${missions.index}/${obj.route.length} · rival ${missions.rivalIndex}/${obj.route.length}`
-      } else if (obj.type === 'escape') {
-        const hearts = '❤'.repeat(3 - missions.strikes) + '♡'.repeat(missions.strikes)
-        objectiveEl.textContent = `${def.title} · ${hearts} · reach the shop`
-      } else if (obj.type === 'smash') {
-        objectiveEl.textContent = `${def.title} · ${missions.smashed}/${obj.targets.length} smashed`
-      } else {
-        objectiveEl.textContent = `${def.title} · ${missions.collected}/${obj.items.length}`
-      }
-    }
-  }
-}
-
-// Dispatcher's speech bubble, projected from her roof (free roam only)
-const bubblePos = new THREE.Vector3()
-let bubbleShown = false
-let bubbleX = -1
-let bubbleY = -1
-let bubbleOp = ''
-function setBubbleOpacity(o: string) {
-  if (bubbleOp !== o) {
-    bubbleOp = o
-    bubbleEl.style.opacity = o
-  }
-}
-function syncBubble() {
-  const show = !titleOpen && missions.state === 'idle'
-  if (show !== bubbleShown) {
-    bubbleShown = show
-    bubbleEl.hidden = !show
-  }
-  if (!show) return
-  npc.bubbleAnchor.getWorldPosition(bubblePos)
-  if (bubblePos.distanceTo(chase.camera.position) > 55) {
-    setBubbleOpacity('0')
-    return
-  }
-  bubblePos.project(chase.camera)
-  if (bubblePos.z > 1) {
-    setBubbleOpacity('0')
-    return
-  }
-  setBubbleOpacity('1')
-  // write styles only on change — this runs every rendered frame
-  const x = Math.round((bubblePos.x * 0.5 + 0.5) * innerWidth)
-  const y = Math.round((-bubblePos.y * 0.5 + 0.5) * innerHeight)
-  if (x !== bubbleX) {
-    bubbleX = x
-    bubbleEl.style.left = `${x}px`
-  }
-  if (y !== bubbleY) {
-    bubbleY = y
-    bubbleEl.style.top = `${y}px`
-  }
-}
-
 // ---------- game loop ----------
-// fixed-timestep physics with render interpolation: handling is identical
-// at any framerate, and the render never shows a raw 60Hz stutter
 const FIXED_DT = 1 / 60
 let accumulator = 0
 let last = performance.now()
@@ -469,10 +292,11 @@ let last = performance.now()
 renderer.setAnimationLoop((now: number) => {
   let dt = (now - last) / 1000
   last = now
-  if (dt > 0.25) dt = 0.25 // backgrounded tab: cap catch-up, no death spiral
+  if (dt > 0.25) dt = 0.25
 
-  const controls = titleOpen ? IDLE : readControls()
-  if (!titleOpen) {
+  const active = !titleOpen && !dead
+  const controls = active ? readControls() : IDLE
+  if (active) {
     if (controls.toggleGearbox) {
       const mode = car.toggleGearMode()
       savePref('rr1.gearMode', mode)
@@ -484,79 +308,59 @@ renderer.setAnimationLoop((now: number) => {
 
   accumulator += dt
   while (accumulator >= FIXED_DT) {
-    traffic.step(FIXED_DT, car.x, car.z) // first: obstacles current before the car moves
-    car.step(FIXED_DT, controls, obstacles)
-    // in the fixed loop: a hitch frame moves the car ~10m — sampled per frame,
-    // that can jump clean over a ring's 5m pass zone; per substep it's ≤0.7m
-    missions.update(FIXED_DT, car.x, car.z)
-    peds.step(FIXED_DT, car.x, car.z, car.vx, car.vz)
-    props.step(FIXED_DT, car.x, car.z, car.vx, car.vz)
+    if (active) {
+      traffic.step(FIXED_DT, car.z) // move traffic before the car reads obstacle positions
+      rails[0].z = rails[1].z = car.z // keep the guardrail walls centred on the player
+      car.surfaceGrip = Math.abs(car.x) < ROAD_HALF ? T.roadGrip : T.dirtGrip
+      car.step(FIXED_DT, controls, obstacles)
+      invuln = Math.max(0, invuln - FIXED_DT)
+      if (car.impactImpulse > 2.5) {
+        if (invuln === 0) {
+          health -= HIT_DMG
+          invuln = INVULN
+          playImpact(1)
+          flashHit()
+          if (health <= 0) {
+            health = 0
+            die()
+          }
+        }
+      }
+    }
     accumulator -= FIXED_DT
   }
+  const alpha = accumulator / FIXED_DT
 
-  // escape-mission hits: red flash + thud + a heart gone
-  if (missions.strikes !== shownStrikes) {
-    if (missions.strikes > shownStrikes && missions.state !== 'idle') {
-      playImpact(1)
-      vignetteEl.classList.remove('hit')
-      void vignetteEl.offsetWidth
-      vignetteEl.classList.add('hit')
-      if (missions.strikes < 3) {
-        showToast(`They rammed the stack! ${'❤'.repeat(3 - missions.strikes)} left`)
-      }
-    }
-    shownStrikes = missions.strikes
-  }
-  // crate crunch
-  if (missions.smashed !== shownSmashed) {
-    if (missions.smashed > shownSmashed) playImpact(0.85)
-    shownSmashed = missions.smashed
-  }
+  car.renderSync(alpha, dt)
+  traffic.render(alpha)
+  road.recenter(car.z)
 
-  if (missions.state !== lastState) {
-    if (missions.state === 'running') {
-      goTimer = 1.0
-      briefTimer = 5
-    }
-    if (missions.state === 'won' && missions.active) {
-      persistSave()
-      syncSettingsUi()
-      if (missions.lastWinWasFirst) {
-        const unlocked = CARS.find((c) => c.unlockedBy === missions.active!.id)
-        if (unlocked) showToast(`🔓 ${unlocked.name} unlocked — press G to drive it`)
-      }
-    }
-    lastState = missions.state
-  }
-  if (goTimer > 0) goTimer -= dt
-  if (briefTimer > 0) briefTimer -= dt
-
-  car.renderSync(accumulator / FIXED_DT, dt)
-  traffic.render(accumulator / FIXED_DT, dt)
-  peds.render()
-  // the shadow camera is a 220m box — keep it centered on the action
-  sun.position.set(car.mesh.position.x + 60, 90, car.mesh.position.z + 25)
+  sun.position.set(car.mesh.position.x + 55, 95, car.mesh.position.z + 30)
   sun.target.position.set(car.mesh.position.x, 0, car.mesh.position.z)
-  const speedRatio = Math.min(1, car.speed / T.maxSpeed)
-  // drift cam: hang behind the velocity vector while the rear is out
-  const velHeading = car.speed > 2 ? Math.atan2(-car.vx, -car.vz) : car.visHeading
-  const driftBlend = motionFull ? Math.min(0.55, Math.abs(car.vL) / 14) : 0
-  chase.update(dt, car.mesh.position, car.visHeading, speedRatio, velHeading, driftBlend)
+  sun.target.updateMatrixWorld()
 
-  // dust + skid marks while the rear is loose (or handbrake dragging at speed)
-  const sliding = Math.abs(car.vL) > 4 || (controls.handbrake && Math.abs(car.vF) > 3)
+  const speedRatio = Math.min(1, car.speed / T.maxSpeed)
+  chase.update(dt, car.mesh.position)
+
+  // drift smoke + skid marks on high slip
+  const slip = Math.abs(car.vL)
+  const onRoad = Math.abs(car.x) < ROAD_HALF
+  const sliding = active && (slip > 3.5 || (controls.handbrake && Math.abs(car.vF) > 3))
   if (sliding) {
     car.rearWheelWorld(-1, dustL)
     car.rearWheelWorld(1, dustR)
-    dust.emitFrom(dustL, 35, dt)
-    dust.emitFrom(dustR, 35, dt)
+    const rate = onRoad ? 55 + slip * 7 : 85 + slip * 9 // thick tire smoke
+    dust.emitFrom(dustL, rate, dt)
+    dust.emitFrom(dustR, rate, dt)
     if (!skidActive) {
       skidActive = true
       prevL.copy(dustL)
       prevR.copy(dustR)
-    } else if (prevL.distanceToSquared(dustL) > 0.36) {
-      skids.add(prevL.x, prevL.z, dustL.x, dustL.z)
-      skids.add(prevR.x, prevR.z, dustR.x, dustR.z)
+    } else if (prevL.distanceToSquared(dustL) > 0.3) {
+      if (onRoad && slip > 4) {
+        skids.add(prevL.x, prevL.z, dustL.x, dustL.z)
+        skids.add(prevR.x, prevR.z, dustR.x, dustR.z)
+      }
       prevL.copy(dustL)
       prevR.copy(dustR)
     }
@@ -565,11 +369,12 @@ renderer.setAnimationLoop((now: number) => {
   }
   dust.update(dt)
   skids.update(dt)
-  if (!titleOpen && car.shiftSerial !== heardShiftSerial) {
+
+  if (active && car.shiftSerial !== heardShiftSerial) {
     playShift(car.shiftDirection)
     heardShiftSerial = car.shiftSerial
   }
-  if (!titleOpen) {
+  if (active) {
     updateEngine(
       speedRatio,
       car.rpm,
@@ -579,28 +384,47 @@ renderer.setAnimationLoop((now: number) => {
       currentCar.voice.pitch,
       currentCar.voice.growl,
     )
-  } // silent under the title
-  syncHud()
+  } else {
+    updateEngine(0, 0, false, 0, 0, currentCar.voice.pitch, currentCar.voice.growl) // spin the drone down
+  }
 
+  if (contextLost) {
+    postfx.render()
+    return
+  }
+
+  // HUD
   const kmh = Math.round(car.speed * 3.6)
   const gearLabel = Math.abs(car.vF) < 0.5 ? 'N' : car.vF < 0 ? 'R' : String(car.gear)
-  const gearKey = `${car.gearMode}:${gearLabel}` // compare what we store, or this rewrites every frame
+  const gearKey = `${car.gearMode}:${gearLabel}`
   if (kmh !== shownSpeed || gearKey !== shownGear) {
     shownSpeed = kmh
     shownGear = gearKey
     speedEl.textContent = `${car.gearMode === 'manual' ? 'M' : 'A'}${gearLabel} · ${kmh} km/h`
   }
-  minimap.draw(car, missions, titleOpen)
+  const dist = Math.max(0, Math.floor(-car.z))
+  if (dist !== shownDist) {
+    shownDist = dist
+    distEl.textContent = `${dist} m`
+    distBestEl.textContent = best > 0 ? `best ${best} m` : ''
+  }
+  if (health !== shownHealth) {
+    shownHealth = health
+    healthFill.style.width = `${health}%`
+    healthFill.style.background =
+      health > 60 ? 'linear-gradient(90deg,#4ad07a,#a6e05a)' : health > 30 ? 'linear-gradient(90deg,#ff5a3c,#ffd24a)' : '#ff3b2f'
+  }
 
-  renderer.render(scene, chase.camera)
-  syncBubble() // after render: project() then uses this frame's camera matrices
+  postfx.render()
 })
 
 addEventListener('resize', () => {
-  renderer.setPixelRatio(Math.min(devicePixelRatio, 2)) // dPR changes when moving between displays or zooming
+  renderer.setPixelRatio(quality.pixelRatio)
   renderer.setSize(innerWidth, innerHeight)
   chase.camera.aspect = innerWidth / innerHeight
   chase.camera.updateProjectionMatrix()
+  postfx.setSize(innerWidth, innerHeight)
+  postfx.setPixelRatio(quality.pixelRatio)
 })
 
 renderer.domElement.addEventListener('webglcontextlost', (e) => {
@@ -609,9 +433,8 @@ renderer.domElement.addEventListener('webglcontextlost', (e) => {
   bannerEl.textContent = 'Graphics hiccup — refresh the page'
 })
 
-// debug handles for poking at the game from the console
+// debug handles
 Object.assign(window, {
   __car: car,
-  __readControls: readControls,
-  __game: { renderer, scene, chase, dust, skids, missions, minimap, npc, obstacles, traffic, peds, props, syncHud, syncBubble, closeTitle, showToast },
+  __game: { renderer, scene, chase, traffic, road, postfx, dust, restart, die, showToast },
 })

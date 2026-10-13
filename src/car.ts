@@ -1,7 +1,27 @@
 import * as THREE from 'three'
 import type { Controls } from './input.ts'
-import { toonMat } from './look.ts'
+import { upgradeCarMaterial } from './materials.ts'
 import { TUNING as T } from './tuning.ts'
+import { buildCarForId } from './vehicleMeshes.ts'
+
+// Shared GLTF loader with Draco support — most real-world supercar .glb files
+// (three.js ferrari, Sketchfab exports) are Draco-compressed. One instance so
+// the decoder worker + wasm are fetched once, not per car swap.
+// ponytail: gstatic-hosted decoder, nothing to ship. For an offline deploy,
+// copy three/examples/jsm/libs/draco/ into public/draco and point here instead.
+let _gltfLoader: { loadAsync(url: string): Promise<{ scene: THREE.Group }> } | null = null
+async function loadGLB(url: string) {
+  if (!_gltfLoader) {
+    const { GLTFLoader } = await import('three/addons/loaders/GLTFLoader.js')
+    const { DRACOLoader } = await import('three/addons/loaders/DRACOLoader.js')
+    const draco = new DRACOLoader()
+    draco.setDecoderPath('https://www.gstatic.com/draco/v1/decoders/')
+    const loader = new GLTFLoader()
+    loader.setDRACOLoader(draco)
+    _gltfLoader = loader
+  }
+  return _gltfLoader.loadAsync(url)
+}
 
 // axis-aligned wall footprint (buildings); the car collides as a circle
 export interface Obstacle {
@@ -12,6 +32,20 @@ export interface Obstacle {
 }
 
 const CAR_RADIUS = 1.1
+
+// reusable temporaries for wheel spin/steer — done with quaternions so baked node
+// rotations (common in FBX-converted rigs) survive instead of being overwritten
+const _rollQ = new THREE.Quaternion()
+const _steerQ = new THREE.Quaternion()
+const _wheelWorldQ = new THREE.Quaternion()
+const _bodyQInv = new THREE.Quaternion()
+const _axleDir = new THREE.Vector3()
+const AXIS_VEC: Record<'x' | 'y' | 'z', THREE.Vector3> = {
+  x: new THREE.Vector3(1, 0, 0),
+  y: new THREE.Vector3(0, 1, 0),
+  z: new THREE.Vector3(0, 0, 1),
+}
+const WHEEL_UP = new THREE.Vector3(0, 1, 0)
 
 // downshift only once ratio falls this far below the upshift point — same
 // hysteresis a real automatic uses so it doesn't hunt at a boundary speed
@@ -37,6 +71,12 @@ export class Car {
 
   // interpolated heading for the camera, valid after renderSync
   visHeading = 0
+
+  // surface grip multiplier (1 on asphalt, lower off-road) — set by main loop
+  surfaceGrip = 1
+
+  // impact impulse accumulated this step (for camera shake / audio)
+  impactImpulse = 0
 
   // gearbox state (derived from speed each step). Bands are evenly spaced
   // fractions of maxSpeed — cars differ by count (setGears), so a 4-speed
@@ -102,39 +142,62 @@ export class Car {
   private readonly body: THREE.Group
   private wheels: THREE.Object3D[] = []
   private frontWheels: THREE.Object3D[] = []
+  private wheelRestY: number[] = []
+  private wheelRestQuat: THREE.Quaternion[] = [] // baked orientation of each wheel node
+  private wheelSign: number[] = [] // ±1 so every wheel rolls forward despite mirrored rigs
   private px = 0
   private pz = 0
   private pheading = 0
   private accel = 0
   private steer = 0
+  private steerInput = 0 // smoothed steer target — progressive turn-in, not a snap
+  private throttleInput = 0 // smoothed throttle — weighty power delivery
   private roll = 0
   private pitch = 0
   private steerVis = 0
   private wheelSpin = 0
+  private wheelAxis: 'x' | 'y' | 'z' = 'x' // local roll axis; varies by model rig
+  private spinWheels = true // false leaves tires static for rigs we can't roll cleanly
+  private wheelNodes: string[] | null = null // explicit wheel-pivot names (lowercased) for messy rigs
   private loadSeq = 0
+  private carId = 'dusty'
 
   get speed() {
     return Math.hypot(this.vx, this.vz)
   }
 
   constructor() {
-    this.body = buildFallbackBody()
+    this.body = buildFallbackBody('dusty')
     this.mesh = new THREE.Group()
-    this.mesh.add(this.body, buildPizzaTopper())
+    this.mesh.add(this.body)
+    this.collectWheels(this.body)
   }
 
   step(dt: number, c: Controls, obstacles: Obstacle[] = []) {
     this.px = this.x
     this.pz = this.z
     this.pheading = this.heading
+    this.impactImpulse = 0
+
+    // progressive input: ease steer & throttle toward target so keyboard ±1 doesn't
+    // snap the wheel/pedal. Steering re-centres faster than it reaches lock, so the
+    // car tracks straight cleanly — this is most of what makes it feel weighted, not
+    // arcade-twitchy.
+    const sRate = Math.abs(c.steer) >= Math.abs(this.steerInput) ? T.steerSmooth : T.steerReturn
+    this.steerInput += (c.steer - this.steerInput) * (1 - Math.exp(-sRate * dt))
+    this.steer = this.steerInput
+    this.throttleInput += (c.throttle - this.throttleInput) * (1 - Math.exp(-T.throttleSmooth * dt))
+    const throttle = this.throttleInput
 
     // steering: yaw authority fades with speed; scaling by velocity sign means
     // no turning in place and mirrored steering in reverse, like a real car
-    this.steer = c.steer
     const falloff = 1 / (1 + Math.abs(this.vF) * T.steerFalloff)
     const moving = THREE.MathUtils.clamp(this.vF / 3, -1, 1)
-    const steerBoost = 1 + c.brake * T.brakeSteer + (c.handbrake ? T.handbrakeSteer : 0)
-    this.heading += c.steer * T.steerRate * steerBoost * falloff * moving * dt
+    // brake loads the nose → more turn-in; throttle slightly reduces it
+    const weightSteer = 1 + c.brake * T.weightTransfer * 0.5 - throttle * T.weightTransfer * 0.25
+    const steerBoost =
+      (1 + c.brake * T.brakeSteer + (c.handbrake ? T.handbrakeSteer : 0)) * weightSteer
+    this.heading += this.steer * T.steerRate * steerBoost * falloff * moving * dt
 
     // decompose momentum in the car frame under the new heading — steering
     // converts forward momentum into lateral, and grip bleeds it back out
@@ -151,7 +214,7 @@ export class Car {
       // pedal conflict: brake wins — decelerate to a dead stop and hold there
       a = -Math.sign(vF) * Math.min(Math.abs(vF) / dt, T.brake)
     } else if (c.throttle > 0) {
-      a = c.throttle * T.accel * this.manualTorque(vF)
+      a = throttle * T.accel * this.manualTorque(vF) * this.surfaceGrip
     } else if (c.brake > 0) {
       a = -c.brake * (vF > 0.5 ? T.brake : T.accel)
     } else if (vF !== 0) {
@@ -195,8 +258,11 @@ export class Car {
       this.rpm = this.rpmForGear(ratio, this.gear)
     }
 
-    // lateral: tires bleed sideways momentum; the handbrake keeps it alive
-    const grip = (c.handbrake ? T.driftGrip : T.grip) * (1 + c.brake * T.brakeGrip)
+    // lateral: tires bleed sideways momentum; handbrake / weight / surface matter
+    // throttle unloads the rear (looser), brake loads the nose (grippier)
+    const wt = 1 + c.brake * T.weightTransfer - throttle * T.weightTransfer * 0.55
+    let grip = (c.handbrake ? T.driftGrip : T.grip) * (1 + c.brake * T.brakeGrip) * wt
+    grip *= this.surfaceGrip
     vL *= Math.exp(-grip * dt)
     if (Math.abs(vL) < 0.01) vL = 0 // snap so drifts (and floats) actually end
     if (Math.abs(vL) > 0.5 && Math.abs(vF) > 0) {
@@ -235,8 +301,12 @@ export class Car {
       this.z = cz + nz * CAR_RADIUS
       const vn = this.vx * nx + this.vz * nz
       if (vn < 0) {
+        this.impactImpulse = Math.max(this.impactImpulse, -vn)
         this.vx -= vn * nx
         this.vz -= vn * nz
+        // small speed scrub on hard hits so walls feel solid
+        this.vx *= 0.92
+        this.vz *= 0.92
       }
     }
     // re-derive body-frame speeds after any wall contact
@@ -280,9 +350,11 @@ export class Car {
     this.heading = this.pheading = this.visHeading = heading
     this.vx = this.vz = this.vF = this.vL = 0
     this.accel = this.steer = this.roll = this.pitch = this.steerVis = 0
+    this.steerInput = this.throttleInput = 0
     this.gear = 1
     this.rpm = 0
     this.shiftTimer = 0
+    this.impactImpulse = 0
     this.mesh.position.set(x, 0, z)
     this.mesh.rotation.y = heading
   }
@@ -296,17 +368,36 @@ export class Car {
 
     // visual-only body lean: roll out of slides, pitch under accel/brake
     const k = 1 - Math.exp(-8 * dt)
-    const rollTarget = THREE.MathUtils.clamp(-this.vL * T.leanRoll, -0.12, 0.12)
+    const rollTarget = THREE.MathUtils.clamp(-this.vL * T.leanRoll, -0.14, 0.14)
     this.roll += (rollTarget - this.roll) * k
     this.pitch += (this.accel * T.leanPitch - this.pitch) * k
     this.body.rotation.z = this.roll
     this.body.rotation.x = this.pitch
 
-    // wheels: spin with travel, front pair yaws with steering
+    // wheels: spin with travel, front pair yaws with steering, soft suspension
     this.wheelSpin = (this.wheelSpin - (this.vF * dt) / 0.35) % (Math.PI * 2)
-    this.steerVis += (this.steer * 0.35 - this.steerVis) * k
-    for (const w of this.wheels) w.rotation.x = this.wheelSpin
-    for (const w of this.frontWheels) w.rotation.y = this.steerVis
+    this.steerVis += (this.steer * 0.38 - this.steerVis) * k
+    const compress = THREE.MathUtils.clamp(Math.abs(this.accel) * 0.004 + Math.abs(this.vL) * 0.006, 0, 0.08)
+    const axisVec = AXIS_VEC[this.wheelAxis]
+    for (let i = 0; i < this.wheels.length; i++) {
+      const w = this.wheels[i]
+      // roll about the axle from the baked rest orientation; steer the front pair on top
+      _rollQ.setFromAxisAngle(axisVec, this.wheelSpin * this.wheelSign[i])
+      w.quaternion.copy(this.wheelRestQuat[i]).multiply(_rollQ)
+      if (this.frontWheels.includes(w)) {
+        _steerQ.setFromAxisAngle(WHEEL_UP, this.steerVis)
+        w.quaternion.premultiply(_steerQ)
+      }
+      const rest = this.wheelRestY[i] ?? w.position.y
+      const side = w.position.x >= 0 ? 1 : -1
+      const front = w.position.z < 0 ? 1 : -1
+      // outer wheels dip into a turn; nose dips under brake
+      const dip =
+        compress * 0.6 +
+        Math.max(0, -this.roll * side) * 0.35 +
+        Math.max(0, this.pitch * front) * 0.4
+      w.position.y = rest - dip
+    }
   }
 
   // world position of a rear wheel (side: -1 left, 1 right), written into out
@@ -321,139 +412,146 @@ export class Car {
     )
   }
 
-  // swap the fallback box for a glTF model; keeps the box if loading fails.
-  // recolor overrides material colors by material name — the paint booth.
-  // browser-only — never called from selfcheck/node.
-  async loadModel(url: string, recolor?: Record<string, string>) {
-    const seq = ++this.loadSeq
-    const { GLTFLoader } = await import('three/addons/loaders/GLTFLoader.js')
-    const gltf = await new GLTFLoader().loadAsync(url)
-    if (seq !== this.loadSeq) {
-      // a newer load superseded this one — discard, or quick G-G swaps could
-      // leave whichever model resolved last on screen
-      gltf.scene.traverse((o) => {
-        const m = o as THREE.Mesh
-        if (!m.isMesh) return
-        m.geometry.dispose()
-        const mat = m.material as THREE.MeshStandardMaterial
-        mat.map?.dispose()
-        mat.dispose()
-      })
-      return
-    }
-    const model = gltf.scene
-    model.rotation.y = Math.PI // kenney cars face +z; our forward is -z
+  // match the incoming model's wheel rig — called before loadModel
+  configureWheels(spin: boolean, axis: 'x' | 'y' | 'z', nodes?: string[]) {
+    this.spinWheels = spin
+    this.wheelAxis = axis
+    this.wheelNodes = nodes && nodes.length ? nodes.map((n) => n.toLowerCase()) : null
+  }
 
-    // normalize: scale to the physics footprint (4.2m long), recenter the
-    // pivot (racing-kit models have off-center origins), sit on the ground
-    const box = new THREE.Box3().setFromObject(model)
-    const size = box.getSize(new THREE.Vector3())
-    model.scale.setScalar(4.2 / Math.max(size.x, size.z))
-    box.setFromObject(model)
-    const center = box.getCenter(new THREE.Vector3())
-    model.position.x -= center.x
-    model.position.z -= center.z
-    model.position.y = -box.min.y
-
-    // free the outgoing body's GPU resources (fallback box or previous car)
-    this.body.traverse((o) => {
-      if ((o as THREE.Mesh).isMesh) {
-        const m = o as THREE.Mesh
-        m.geometry.dispose()
-        const mat = m.material as THREE.MeshStandardMaterial
-        mat.map?.dispose() // the model's own colormap — the toon gradient is shared
-        mat.dispose()
-      }
-    })
-    this.body.clear()
-    this.body.add(model)
+  private collectWheels(root: THREE.Object3D) {
     this.wheels = []
     this.frontWheels = []
-    model.traverse((o) => {
-      // realistic pass: keep the glTF's own PBR materials, just tune them so
-      // the paint picks up the environment reflections, and cast shadows
-      const mesh = o as THREE.Mesh
-      if (mesh.isMesh) {
-        mesh.castShadow = true
-        const mat = mesh.material as THREE.MeshStandardMaterial
-        if (mat.isMeshStandardMaterial) {
-          // 2018-era kits (racing kit) ship double-gamma colors — pale pastels.
-          // Re-linearizing restores the vivid paint; textured kits are fine.
-          if (!mat.map) mat.color.convertSRGBToLinear()
-          const paint = recolor?.[mat.name]
-          if (paint) mat.color.set(paint)
-          mat.roughness = Math.min(mat.roughness, 0.5)
-          mat.metalness = Math.max(mat.metalness, 0.1)
-        }
-      }
-      // wheel nodes across kits: 'wheel-front-right' (car kit) and
-      // 'wheelFrontLeft' + 'Mesh_wheelFrontLeft' children (racing kit) —
-      // match case-insensitively and only the outermost wheel node
+    this.wheelRestY = []
+    this.wheelRestQuat = []
+    this.wheelSign = []
+    if (!this.spinWheels) return // rig with no usable pivots — leave the tires static
+    this.body.getWorldQuaternion(_bodyQInv).invert() // read axle direction in car-local space (heading-independent)
+    const axisVec = AXIS_VEC[this.wheelAxis]
+    root.traverse((o) => {
       const lname = o.name.toLowerCase()
-      if (!lname.includes('wheel')) return
-      if (o.parent && o.parent.name.toLowerCase().includes('wheel')) return
+      if (this.wheelNodes) {
+        if (!this.wheelNodes.includes(lname)) return // explicit pivots (e.g. urus FL/FR/RL/RR)
+      } else {
+        // a road wheel has "wheel" but isn't the interior steering wheel or a sub-part
+        if (!lname.includes('wheel') || lname.includes('steering')) return
+        if (o.parent && o.parent.name.toLowerCase().includes('wheel')) return
+      }
+      // roll sign = the axle's car-lateral (x) direction, so mirrored wheels (whose
+      // local axis points the other way) still roll forward instead of backward.
+      o.getWorldQuaternion(_wheelWorldQ)
+      _axleDir.copy(axisVec).applyQuaternion(_wheelWorldQ).applyQuaternion(_bodyQInv)
+      o.matrixAutoUpdate = true // matrix-defined FBX nodes can ship with this off
       this.wheels.push(o)
-      if (lname.includes('front')) {
-        o.rotation.order = 'YXZ' // steer yaw first, then spin
+      this.wheelRestY.push(o.position.y)
+      this.wheelRestQuat.push(o.quaternion.clone())
+      this.wheelSign.push(_axleDir.x < 0 ? -1 : 1)
+      if (lname === 'fl' || lname === 'fr' || lname.includes('front') || lname.includes('_fl') || lname.includes('_fr')) {
         this.frontWheels.push(o)
       }
     })
   }
-}
 
-function buildFallbackBody(): THREE.Group {
-  const body = new THREE.Group()
-  const paint = toonMat('#e8734a')
-  const dark = toonMat('#2f2f38')
-
-  const chassis = new THREE.Mesh(new THREE.BoxGeometry(1.9, 0.55, 4.2), paint)
-  chassis.position.y = 0.55
-  chassis.castShadow = true
-  const cabin = new THREE.Mesh(new THREE.BoxGeometry(1.6, 0.45, 1.9), dark)
-  cabin.position.set(0, 1.0, 0.35) // set back, so the front reads as the hood
-  cabin.castShadow = true
-  body.add(chassis, cabin)
-
-  const wheelGeo = new THREE.CylinderGeometry(0.36, 0.36, 0.3, 12)
-  wheelGeo.rotateZ(Math.PI / 2)
-  for (const [wx, wz] of [
-    [-0.85, -1.35],
-    [0.85, -1.35],
-    [-0.85, 1.35],
-    [0.85, 1.35],
-  ]) {
-    const wheel = new THREE.Mesh(wheelGeo, dark)
-    wheel.position.set(wx, 0.36, wz)
-    body.add(wheel)
+  private disposeBody() {
+    this.body.traverse((o) => {
+      if ((o as THREE.Mesh).isMesh) {
+        const m = o as THREE.Mesh
+        m.geometry.dispose()
+        const mat = m.material
+        if (Array.isArray(mat)) mat.forEach((x) => x.dispose())
+        else {
+          const sm = mat as THREE.MeshStandardMaterial
+          sm.map?.dispose()
+          sm.dispose()
+        }
+      }
+    })
+    this.body.clear()
   }
-  return body
+
+  // Prefer a high-quality procedural shell (clearcoat paint) for consistent
+  // realism; still try glTF if procedural id is unknown. recolor applies paint.
+  useProcedural(id: string) {
+    this.carId = id
+    this.disposeBody()
+    const model = buildCarForId(id)
+    this.body.add(model)
+    this.collectWheels(this.body)
+  }
+
+  // swap the fallback box for a glTF model; upgrades materials to clearcoat PBR.
+  // recolor overrides material colors by material name — the paint booth.
+  // browser-only — never called from selfcheck/node.
+  async loadModel(
+    url: string,
+    recolor?: Record<string, string>,
+    carId?: string,
+    glb?: boolean,
+    modelYaw?: number,
+  ) {
+    const seq = ++this.loadSeq
+    if (carId) this.carId = carId
+
+    // Prefer procedural mid-poly with physical paint — Kenney kits stay cartoony
+    // even under clearcoat. Procedural gives a consistent realistic fleet.
+    // glb:true opts a car out — for genuinely photoreal models worth the load.
+    if (carId && !glb) {
+      this.useProcedural(carId)
+      return
+    }
+
+    try {
+      const gltf = await loadGLB(url)
+      if (seq !== this.loadSeq) {
+        gltf.scene.traverse((o) => {
+          const m = o as THREE.Mesh
+          if (!m.isMesh) return
+          m.geometry.dispose()
+          const mat = m.material as THREE.MeshStandardMaterial
+          mat.map?.dispose()
+          mat.dispose()
+        })
+        return
+      }
+      const model = gltf.scene
+      model.rotation.y = modelYaw ?? Math.PI // kenney cars face +z; our forward is -z
+
+      const box = new THREE.Box3().setFromObject(model)
+      const size = box.getSize(new THREE.Vector3())
+      model.scale.setScalar(4.2 / Math.max(size.x, size.z))
+      box.setFromObject(model)
+      const center = box.getCenter(new THREE.Vector3())
+      model.position.x -= center.x
+      model.position.z -= center.z
+      model.position.y = -box.min.y
+
+      this.disposeBody()
+      this.body.add(model)
+
+      model.traverse((o) => {
+        const mesh = o as THREE.Mesh
+        if (!mesh.isMesh) return
+        mesh.castShadow = true
+        mesh.receiveShadow = true
+        const mats = Array.isArray(mesh.material) ? mesh.material : [mesh.material]
+        const upgraded = mats.map((mat) => {
+          const sm = mat as THREE.MeshStandardMaterial
+          if (sm.isMeshStandardMaterial) return upgradeCarMaterial(sm, recolor)
+          return mat
+        })
+        mesh.material = upgraded.length === 1 ? upgraded[0] : upgraded
+      })
+      this.collectWheels(this.body)
+    } catch (e) {
+      console.warn('car model failed to load, using procedural', e)
+      this.useProcedural(this.carId)
+    }
+  }
 }
 
-function buildPizzaTopper(): THREE.Group {
-  const topper = new THREE.Group()
-  const boxMat = toonMat('#f5d16d')
-  const red = toonMat('#d43f32')
-  const cheese = toonMat('#ffd66b')
-  const crust = toonMat('#b86d3b')
-
-  const box = new THREE.Mesh(new THREE.BoxGeometry(1.45, 0.2, 1.05), boxMat)
-  box.position.set(0, 1.48, -0.08)
-  const stripe = new THREE.Mesh(new THREE.BoxGeometry(1.5, 0.08, 0.16), red)
-  stripe.position.set(0, 1.61, -0.08)
-
-  const sliceShape = new THREE.Shape()
-  sliceShape.moveTo(0, 0.42)
-  sliceShape.lineTo(-0.35, -0.3)
-  sliceShape.lineTo(0.35, -0.3)
-  sliceShape.lineTo(0, 0.42)
-  const slice = new THREE.Mesh(new THREE.ShapeGeometry(sliceShape), cheese)
-  slice.rotation.x = -Math.PI / 2
-  slice.position.set(0, 1.72, -0.08)
-  slice.scale.setScalar(0.75)
-
-  const crustEdge = new THREE.Mesh(new THREE.BoxGeometry(0.54, 0.06, 0.11), crust)
-  crustEdge.position.set(0, 1.735, 0.17)
-
-  topper.add(box, stripe, slice, crustEdge)
-  return topper
+function buildFallbackBody(id: string): THREE.Group {
+  const g = new THREE.Group()
+  g.add(buildCarForId(id))
+  return g
 }
+

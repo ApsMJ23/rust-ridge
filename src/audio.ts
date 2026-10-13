@@ -1,13 +1,15 @@
-// All audio is synthesized with WebAudio: engine, tire scrub, shifts, and horn.
-// initAudio must run from user gestures; call it from every gesture until the
-// context actually resumes.
+// Audio is WebAudio: each car plays its own real recorded engine loop (CC0),
+// with synthesized tire scrub, shifts, wind, and horn. initAudio must run from
+// user gestures; call it from every gesture until the context actually resumes.
 let ctx: AudioContext | null = null
 let master: GainNode
-let engOsc: OscillatorNode
-let engSub: OscillatorNode
-let engGain: GainNode
-let engFilter: BiquadFilterNode
+let sampleFilter: BiquadFilterNode // tone-shapes the recorded engine loop
+let sampleGain: GainNode
+let engineSrc: AudioBufferSourceNode | null = null // the current looping engine recording
+let engineUrl = './ferrari_engine.wav' // per-car loop; set via setEngineLoop before/after init
+const engineBuffers = new Map<string, AudioBuffer>() // decoded loops, cached across swaps
 let scrubGain: GainNode
+let windGain: GainNode | null = null
 let muted = false
 
 export function initAudio() {
@@ -17,27 +19,15 @@ export function initAudio() {
     master.gain.value = muted ? 0 : 1
     master.connect(ctx.destination)
 
-    engGain = ctx.createGain()
-    engGain.gain.value = 0
-    engFilter = ctx.createBiquadFilter()
-    engFilter.type = 'lowpass'
-    engFilter.frequency.value = 320
-    engFilter.Q.value = 0.5
-
-    engOsc = ctx.createOscillator()
-    engOsc.type = 'sawtooth'
-    engSub = ctx.createOscillator()
-    engSub.type = 'square'
-    engSub.detune.value = -9 // slight beat against the main osc — thickens the drone
-    const subGain = ctx.createGain()
-    subGain.gain.value = 0.32
-    engOsc.connect(engFilter)
-    engSub.connect(subGain)
-    subGain.connect(engFilter)
-    engFilter.connect(engGain)
-    engGain.connect(master)
-    engOsc.start()
-    engSub.start()
+    // per-car recorded engine loop (CC0, OpenGameArt); playbackRate tracks rpm
+    sampleFilter = ctx.createBiquadFilter()
+    sampleFilter.type = 'lowpass'
+    sampleFilter.frequency.value = 900
+    sampleGain = ctx.createGain()
+    sampleGain.gain.value = 0
+    sampleFilter.connect(sampleGain)
+    sampleGain.connect(master)
+    startEngine(engineUrl)
 
     scrubGain = ctx.createGain()
     scrubGain.gain.value = 0
@@ -53,6 +43,20 @@ export function initAudio() {
     scrubGain.connect(master)
     scrub.start()
 
+    // wind rush at speed
+    windGain = ctx.createGain()
+    windGain.gain.value = 0
+    const windFilter = ctx.createBiquadFilter()
+    windFilter.type = 'highpass'
+    windFilter.frequency.value = 400
+    const wind = ctx.createBufferSource()
+    wind.buffer = makeNoiseBuffer(ctx)
+    wind.loop = true
+    wind.connect(windFilter)
+    windFilter.connect(windGain)
+    windGain.connect(master)
+    wind.start()
+
     // rAF stops in hidden tabs but WebAudio does not, so silence the drone.
     document.addEventListener('visibilitychange', () => {
       if (!ctx) return
@@ -63,8 +67,48 @@ export function initAudio() {
   if (ctx.state === 'suspended' && !document.hidden) void ctx.resume()
 }
 
-// pitch/growl give every car its own voice: pitch scales the oscillators
-// (formula screams, firetruck rumbles), growl opens the filter for grit
+// load (or reuse) a car's engine loop and switch the looping source to it
+function startEngine(url: string) {
+  if (!ctx) return
+  const audio = ctx
+  const begin = (buf: AudioBuffer) => {
+    if (engineUrl !== url || !ctx) return // a newer swap superseded this load
+    if (engineSrc) {
+      try {
+        engineSrc.stop()
+      } catch {
+        /* already stopped */
+      }
+      engineSrc.disconnect()
+    }
+    engineSrc = audio.createBufferSource()
+    engineSrc.buffer = buf
+    engineSrc.loop = true
+    engineSrc.connect(sampleFilter)
+    engineSrc.start()
+  }
+  const cached = engineBuffers.get(url)
+  if (cached) {
+    begin(cached)
+    return
+  }
+  fetch(url)
+    .then((r) => r.arrayBuffer())
+    .then((b) => audio.decodeAudioData(b))
+    .then((buf) => {
+      engineBuffers.set(url, buf)
+      begin(buf)
+    })
+    .catch((e) => console.warn('engine loop load failed', url, e))
+}
+
+// pick the current car's engine recording; safe to call before audio starts
+export function setEngineLoop(url: string) {
+  engineUrl = url
+  if (ctx) startEngine(url)
+}
+
+// the recorded loop is pitched by rpm; pitch = per-car base speed, growl = tone
 export function updateEngine(
   speedRatio: number,
   rpm: number,
@@ -77,41 +121,54 @@ export function updateEngine(
   if (!ctx) return
   const t = ctx.currentTime
   const load = 0.35 + throttle * 0.65
-  const f = (48 + 150 * rpm + 28 * speedRatio) * pitch
-  engOsc.frequency.setTargetAtTime(f, t, 0.05)
-  engSub.frequency.setTargetAtTime(f / 2, t, 0.06)
-  engFilter.frequency.setTargetAtTime((260 + rpm * 480 + throttle * 260) * growl, t, 0.07)
-
   const moving = Math.min(1, speedRatio * 5)
-  const vol = (0.018 + 0.075 * moving) * load * (0.5 + 0.5 * rpm)
-  engGain.gain.setTargetAtTime(shifting ? vol * 0.3 : vol, t, 0.04)
-  scrubGain.gain.setTargetAtTime(Math.min(0.045, slideRatio * 0.04), t, 0.06)
+
+  // recorded engine loop: pitch tracks rpm, level tracks load, tone opens on the gas
+  if (engineSrc) {
+    const pitchMul = 0.78 + 0.18 * pitch // per-car base pitch, gently (raw pitch would chipmunk)
+    engineSrc.playbackRate.setTargetAtTime(pitchMul * (0.82 + 0.85 * rpm + 0.1 * speedRatio), t, 0.05)
+  }
+  const sv = (0.06 + 0.24 * moving) * load // the only engine source now, so a touch louder
+  sampleGain.gain.setTargetAtTime(shifting ? sv * 0.7 : sv, t, 0.05) // gentle dip on shift, not a cut-out
+  sampleFilter.frequency.setTargetAtTime((450 + rpm * 2600 + throttle * 1500) * growl, t, 0.06)
+
+  // tire squeal ramps harder with slip; wind rush at speed
+  scrubGain.gain.setTargetAtTime(Math.min(0.065, slideRatio * slideRatio * 0.07), t, 0.05)
+  if (windGain) windGain.gain.setTargetAtTime(Math.min(0.028, speedRatio * speedRatio * 0.032), t, 0.12)
 }
 
+// Mechanical gearbox clunk: a short filtered noise clack + a soft low thunk for
+// weight. No tonal frequency ramp — that "bloop" was the bad part.
 export function playShift(direction: -1 | 1) {
   if (!ctx) return
   const t = ctx.currentTime
-  const chirp = ctx.createOscillator()
-  chirp.type = direction > 0 ? 'triangle' : 'sawtooth'
-  chirp.frequency.setValueAtTime(direction > 0 ? 220 : 165, t)
-  chirp.frequency.exponentialRampToValueAtTime(direction > 0 ? 92 : 260, t + 0.11)
-
-  const chirpGain = ctx.createGain()
-  chirpGain.gain.setValueAtTime(0.055, t)
-  chirpGain.gain.exponentialRampToValueAtTime(0.001, t + 0.13)
-  chirp.connect(chirpGain)
-  chirpGain.connect(master)
-  chirp.start(t)
-  chirp.stop(t + 0.14)
 
   const clack = ctx.createBufferSource()
   clack.buffer = makeClickBuffer(ctx)
+  const bp = ctx.createBiquadFilter()
+  bp.type = 'bandpass'
+  bp.frequency.value = direction > 0 ? 550 : 420 // low + dull — just a faint tick under the boom
+  bp.Q.value = 0.6
   const clackGain = ctx.createGain()
-  clackGain.gain.setValueAtTime(0.035, t)
-  clackGain.gain.exponentialRampToValueAtTime(0.001, t + 0.06)
-  clack.connect(clackGain)
+  clackGain.gain.setValueAtTime(0.015, t) // barely there now
+  clackGain.gain.exponentialRampToValueAtTime(0.001, t + 0.04)
+  clack.connect(bp)
+  bp.connect(clackGain)
   clackGain.connect(master)
-  clack.start(t + 0.015)
+  clack.start(t)
+
+  // the boom: a deep low thump that carries the whole shift
+  const thunk = ctx.createOscillator()
+  thunk.type = 'sine'
+  thunk.frequency.setValueAtTime(direction > 0 ? 95 : 78, t)
+  thunk.frequency.exponentialRampToValueAtTime(38, t + 0.09)
+  const thunkGain = ctx.createGain()
+  thunkGain.gain.setValueAtTime(0.1, t)
+  thunkGain.gain.exponentialRampToValueAtTime(0.001, t + 0.14)
+  thunk.connect(thunkGain)
+  thunkGain.connect(master)
+  thunk.start(t)
+  thunk.stop(t + 0.15)
 }
 
 // pitch 1 = the player's horn; traffic honks lower and quieter
